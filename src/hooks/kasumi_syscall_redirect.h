@@ -13,7 +13,12 @@
 #endif
 
 extern void *kasumi_syscall_table;
-extern int  kasumi_syscall_dispatcher_nr;
+/*
+ * Legacy name retained for ABI-internal compatibility.  Direct syscall-table
+ * patching no longer owns a dispatcher syscall number: -1 means inactive and
+ * any non-negative value means the TSR redirect layer is active.
+ */
+extern int kasumi_syscall_dispatcher_nr;
 typedef long (*kasumi_syscall_hook_fn)(const struct pt_regs *regs);
 
 int  kasumi_syscall_redirect_init(void);
