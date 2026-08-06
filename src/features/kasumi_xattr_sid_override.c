@@ -160,7 +160,7 @@ static void kasumi_xattr_sid_meta_free_rcu(struct rcu_head *rcu)
 static KASUMI_NOCFI int kasumi_xattr_sid_install_sid(struct inode *target_inode, u32 source_sid)
 {
 	struct kasumi_xattr_sid_meta *m, *existing;
-	u32 orig_sid;
+	int ret = 0;
 
 	if (!READ_ONCE(kasumi_xattr_sid_ready))
 		return -EOPNOTSUPP;
@@ -171,52 +171,64 @@ static KASUMI_NOCFI int kasumi_xattr_sid_install_sid(struct inode *target_inode,
 	if (!kasumi_ihold)
 		return -EOPNOTSUPP;
 
-	if (!kasumi_selinux_read_sid(target_inode, &orig_sid))
-		return -ENOENT;
-
 	m = kzalloc(sizeof(*m), GFP_KERNEL);
 	if (!m)
 		return -ENOMEM;
 	m->inode = target_inode;
-	m->orig_sid = orig_sid;
 	m->spoof_sid = source_sid;
 	m->refs = 1;
 	kasumi_ihold(target_inode);
 
+	/*
+	 * Keep the inode SID and its metadata transactionally consistent.  The
+	 * old implementation published metadata before the SID write and updated
+	 * an existing entry before knowing whether the write succeeded.  Besides
+	 * leaving stale metadata on failure, its rollback dereferenced an entry
+	 * after dropping the table lock, allowing an uninstall/RCU free race.
+	 *
+	 * SID reads and writes only take SELinux's inode spinlock and cannot sleep,
+	 * so they are safe while the short metadata-table critical section is held.
+	 */
 	spin_lock(&kasumi_xattr_sid_lock);
+	if (!READ_ONCE(kasumi_xattr_sid_ready)) {
+		ret = -ESHUTDOWN;
+		goto out_unlock;
+	}
+
 	existing = kasumi_xattr_sid_lookup_rcu(target_inode);
 	if (existing) {
+		if (!kasumi_selinux_write_sid(target_inode, source_sid)) {
+			ret = -ENOENT;
+			goto out_unlock;
+		}
 		existing->spoof_sid = source_sid;
 		existing->refs++;
 		spin_unlock(&kasumi_xattr_sid_lock);
 		iput(m->inode);
 		kfree(m);
-		if (!kasumi_selinux_write_sid(target_inode, source_sid)) {
-			spin_lock(&kasumi_xattr_sid_lock);
-			if (existing->refs > 0)
-				existing->refs--;
-			spin_unlock(&kasumi_xattr_sid_lock);
-			return -ENOENT;
-		}
 		atomic64_inc(&kasumi_hook_stats.xattr_sid_overrides);
 		return 0;
+	}
+
+	if (!kasumi_selinux_read_sid(target_inode, &m->orig_sid) ||
+	    !kasumi_selinux_write_sid(target_inode, source_sid)) {
+		ret = -ENOENT;
+		goto out_unlock;
 	}
 
 	hash_add_rcu(kasumi_xattr_sid_table, &m->node, (unsigned long)target_inode);
 	spin_unlock(&kasumi_xattr_sid_lock);
 
-	if (!kasumi_selinux_write_sid(target_inode, source_sid)) {
-		spin_lock(&kasumi_xattr_sid_lock);
-		hash_del_rcu(&m->node);
-		spin_unlock(&kasumi_xattr_sid_lock);
-		iput(target_inode);
-		call_rcu(&m->rcu, kasumi_xattr_sid_meta_free_rcu);
-		return -ENOENT;
-	}
-
 	atomic64_inc(&kasumi_hook_stats.xattr_sid_overrides);
-	kasumi_log("xattr_sid: inode %p sid %u -> %u\n", target_inode, orig_sid, source_sid);
+	kasumi_log("xattr_sid: inode %p sid %u -> %u\n",
+		   target_inode, m->orig_sid, source_sid);
 	return 0;
+
+out_unlock:
+	spin_unlock(&kasumi_xattr_sid_lock);
+	iput(m->inode);
+	kfree(m);
+	return ret;
 }
 
 int kasumi_xattr_sid_install(struct inode *target_inode, const char *source_path)
