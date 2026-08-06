@@ -180,14 +180,9 @@ static KASUMI_NOCFI int kasumi_xattr_sid_install_sid(struct inode *target_inode,
 	kasumi_ihold(target_inode);
 
 	/*
-	 * Keep the inode SID and its metadata transactionally consistent.  The
-	 * old implementation published metadata before the SID write and updated
-	 * an existing entry before knowing whether the write succeeded.  Besides
-	 * leaving stale metadata on failure, its rollback dereferenced an entry
-	 * after dropping the table lock, allowing an uninstall/RCU free race.
-	 *
-	 * SID reads and writes only take SELinux's inode spinlock and cannot sleep,
-	 * so they are safe while the short metadata-table critical section is held.
+	 * Keep the inode SID and its metadata transactionally consistent. The
+	 * metadata lock serializes installs, uninstalls and module teardown; SID
+	 * access only takes SELinux's inode spinlock and cannot sleep.
 	 */
 	spin_lock(&kasumi_xattr_sid_lock);
 	if (!READ_ONCE(kasumi_xattr_sid_ready)) {
@@ -244,36 +239,37 @@ int kasumi_xattr_sid_install(struct inode *target_inode, const char *source_path
 	return kasumi_xattr_sid_install_sid(target_inode, source_sid);
 }
 
-static struct kasumi_xattr_sid_meta *kasumi_xattr_sid_uninstall_locked(struct inode *inode)
-{
-	struct kasumi_xattr_sid_meta *m;
-
-	m = kasumi_xattr_sid_lookup_rcu(inode);
-	if (!m)
-		return NULL;
-	if (m->refs > 1) {
-		m->refs--;
-		return NULL;
-	}
-	hash_del_rcu(&m->node);
-	return m;
-}
-
 static int kasumi_xattr_sid_uninstall_inode(struct inode *inode)
 {
 	struct kasumi_xattr_sid_meta *m;
+	int ret = 0;
 
 	if (!inode)
 		return -EINVAL;
 
+	/* Restore the inode before unpublishing its metadata. Otherwise a new
+	 * installer can observe the entry as absent, publish a replacement, and
+	 * then have the old uninstaller overwrite the newly spoofed SID.
+	 */
 	spin_lock(&kasumi_xattr_sid_lock);
-	m = kasumi_xattr_sid_uninstall_locked(inode);
+	m = kasumi_xattr_sid_lookup_rcu(inode);
+	if (!m) {
+		spin_unlock(&kasumi_xattr_sid_lock);
+		return 0;
+	}
+	if (m->refs > 1) {
+		m->refs--;
+		spin_unlock(&kasumi_xattr_sid_lock);
+		return 0;
+	}
+	if (!kasumi_selinux_write_sid(m->inode, m->orig_sid)) {
+		ret = -ENOENT;
+		spin_unlock(&kasumi_xattr_sid_lock);
+		return ret;
+	}
+	hash_del_rcu(&m->node);
 	spin_unlock(&kasumi_xattr_sid_lock);
 
-	if (!m)
-		return 0;
-
-	(void)kasumi_selinux_write_sid(m->inode, m->orig_sid);
 	iput(m->inode);
 	call_rcu(&m->rcu, kasumi_xattr_sid_meta_free_rcu);
 	return 0;
@@ -410,8 +406,12 @@ void kasumi_xattr_sid_override_exit(void)
 
 	WRITE_ONCE(kasumi_xattr_sid_ready, false);
 
+	/* Keep teardown serialized with install/uninstall through both the SID
+	 * restore and metadata removal. New installs re-check ready under this lock.
+	 */
 	spin_lock(&kasumi_xattr_sid_lock);
 	hash_for_each_safe(kasumi_xattr_sid_table, bkt, tmp, m, node) {
+		(void)kasumi_selinux_write_sid(m->inode, m->orig_sid);
 		hash_del_rcu(&m->node);
 		hlist_add_head(&m->node, &free_list);
 	}
@@ -419,7 +419,6 @@ void kasumi_xattr_sid_override_exit(void)
 
 	hlist_for_each_entry_safe(m, tmp, &free_list, node) {
 		hlist_del(&m->node);
-		(void)kasumi_selinux_write_sid(m->inode, m->orig_sid);
 		iput(m->inode);
 		call_rcu(&m->rcu, kasumi_xattr_sid_meta_free_rcu);
 	}
