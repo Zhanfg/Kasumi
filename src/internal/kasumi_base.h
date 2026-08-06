@@ -11,6 +11,7 @@
 #define _KASUMI_BASE_H
 
 #include <linux/kernel.h>
+#include <linux/moduleparam.h>
 #include <linux/types.h>
 #include <linux/version.h>
 
